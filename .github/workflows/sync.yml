@@ -1,0 +1,63 @@
+# Keeps the GitHub Pages mirror in sync with the live schedule (edits in the admin page included).
+# Every 5 minutes: fetch the dataset from the Worker, and if its version changed, re-encrypt and redeploy.
+name: Sync schedule
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Fetch the live schedule
+        env:
+          EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
+        run: |
+          curl -fsS --retry 3 -H "Authorization: Bearer $EXPORT_TOKEN" https://schedule.deadseatrip.workers.dev/api/export -o dataset.json
+
+      - name: Skip if the site already has this version
+        id: check
+        run: |
+          live=$(curl -fsS "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/data/meta.json?t=$(date +%s)" | jq -r .version || echo none)
+          new=$(jq -r .version dataset.json)
+          echo "live=$live new=$new event=${{ github.event_name }}"
+          if [ "$live" = "$new" ] && [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Encrypt the schedules
+        if: steps.check.outputs.changed == 'true'
+        run: node scripts/build-static-data.mjs dataset.json static/salt.txt site/data
+
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.check.outputs.changed == 'true'
+        with:
+          path: site
+
+      - id: deploy
+        if: steps.check.outputs.changed == 'true'
+        uses: actions/deploy-pages@v4
